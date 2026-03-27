@@ -973,10 +973,45 @@ def normalize_seller_preview_name(raw_name: str) -> str:
         return ""
 
     # Слишком длинные/короткие строки вероятнее не имя автора
-    if len(cleaned) < 2 or len(cleaned) > 60:
+    if len(cleaned) < 2 or len(cleaned) > 120:
         return ""
 
     return cleaned
+
+
+def extract_seller_from_card(card) -> str:
+    """
+    Пытается максимально устойчиво извлечь имя продавца с карточки выдачи.
+    Возвращает пустую строку, если надёжно определить не удалось.
+    """
+    # 1) Прямые селекторы
+    seller_elem = select_first(card, "card_seller_name")
+    if seller_elem:
+        candidate = seller_elem.get_text(" ", strip=True)
+        # Частый случай: "ИМЯ 2 завершенных объявления"
+        candidate = re.split(r'\d+\s+заверш', candidate, flags=re.IGNORECASE)[0].strip()
+        normalized = normalize_seller_preview_name(candidate)
+        if normalized:
+            return normalized
+
+    # 2) Эвристика по текстовым строкам карточки:
+    # ищем строку перед "... завершенных объявлений"
+    lines = [re.sub(r"\s+", " ", s).strip() for s in card.stripped_strings]
+    lines = [s for s in lines if s]
+    for idx, line in enumerate(lines):
+        if re.search(r'\d+\s+заверш[её]н', line, flags=re.IGNORECASE):
+            for j in range(idx - 1, -1, -1):
+                normalized = normalize_seller_preview_name(lines[j])
+                if normalized:
+                    return normalized
+
+    # 3) Эвристика по ссылкам профиля
+    for a in card.select('a[href*="/user/"], a[href*="/profile/"]'):
+        text = normalize_seller_preview_name(a.get_text(" ", strip=True))
+        if text:
+            return text
+
+    return ""
 
 
 def normalize_listing_title(raw_title: str) -> str:
@@ -1136,6 +1171,9 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
     total_favorite_cards = 0
     total_with_url = 0
     total_without_url = 0
+    total_with_seller = 0
+    total_without_seller = 0
+    total_full_recognized = 0
     total_price_skipped = 0
     total_broker_skipped = 0
     total_seen_skipped = 0
@@ -1189,7 +1227,7 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
                 logger.info(f"Страница {current_page}: карточки не найдены, завершаем")
                 break
             
-            raw_on_page = max(len(cards), len(favorite_marks))
+            raw_on_page = len(cards)
             total_raw_cards += raw_on_page
             total_favorite_cards += len(favorite_marks)
             logger.debug(
@@ -1201,6 +1239,8 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
             
             page_listings = []
             page_with_url = 0
+            page_with_seller = 0
+            page_full_recognized = 0
             for card in cards:
                 try:
                     # Извлекаем URL
@@ -1223,6 +1263,14 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
                     title = extract_title_from_card(card, item_url=item_url)
                     if not title:
                         title = "Без названия"
+
+                    # Извлекаем продавца (если правая часть не прогрузилась — оставляем пусто, не пропускаем)
+                    seller_name = extract_seller_from_card(card)
+                    if seller_name:
+                        total_with_seller += 1
+                        page_with_seller += 1
+                    else:
+                        total_without_seller += 1
                     
                     # Извлекаем цену
                     price = 0
@@ -1241,10 +1289,6 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
                         continue
 
                     # Первичная фильтрация по автору (брокер/не брокер) прямо на выдаче
-                    seller_name = ""
-                    seller_elem = select_first(card, "card_seller_name")
-                    if seller_elem:
-                        seller_name = normalize_seller_preview_name(seller_elem.get_text(" ", strip=True))
                     if seller_name and seller_name.lower() in brokers_set:
                         logger.debug(f"Пропуск (брокер на выдаче): {seller_name} | {title[:50]}")
                         total_broker_skipped += 1
@@ -1259,6 +1303,8 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
                             continue
                     
                     if title and item_url:
+                        page_full_recognized += 1
+                        total_full_recognized += 1
                         sig = listing_signature(title, seller_name)
                         if sig:
                             runtime_seen_signatures.add(sig)
@@ -1275,13 +1321,15 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
             
             if not page_listings:
                 logger.info(
-                    f"Страница {current_page}: контейнеров={len(cards)}, URL распознано={page_with_url}, после первичной фильтрации карточек нет "
+                    f"Страница {current_page}: контейнеров={len(cards)}, URL распознано={page_with_url}, продавец распознан={page_with_seller}, "
+                    f"полностью распознано={page_full_recognized}, после первичной фильтрации карточек нет "
                     f"(всего после фильтрации: {total_raw_cards}/{len(all_listings)}), идём дальше по пагинации"
                 )
             else:
                 all_listings.extend(page_listings)
                 logger.info(
-                    f"Страница {current_page}: контейнеров={len(cards)}, URL распознано={page_with_url}, добавлено {len(page_listings)} карточек "
+                    f"Страница {current_page}: контейнеров={len(cards)}, URL распознано={page_with_url}, продавец распознан={page_with_seller}, "
+                    f"полностью распознано={page_full_recognized}, добавлено {len(page_listings)} карточек "
                     f"(всего после фильтрации: {total_raw_cards}/{len(all_listings)})"
                 )
 
@@ -1304,11 +1352,15 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
     
     logger.info(
         "Итог первичного сбора: сырых карточек=%s (по сердцам=%s), распознано URL=%s, не распознано URL=%s, "
+        "распознано продавцов=%s, не распознано продавцов=%s, полностью распознано=%s, "
         "после фильтрации=%s (%s/%s), пропущено по цене=%s, пропущено брокеров=%s, пропущено как дубли title+seller=%s",
         total_raw_cards,
         total_favorite_cards,
         total_with_url,
         total_without_url,
+        total_with_seller,
+        total_without_seller,
+        total_full_recognized,
         len(all_listings),
         total_raw_cards,
         len(all_listings),
