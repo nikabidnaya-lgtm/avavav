@@ -886,6 +886,73 @@ def parse_price(price_text: str) -> int:
         return 0
 
 
+def extract_item_url_from_card(card) -> str:
+    """Робастно извлекает URL карточки из контейнера выдачи."""
+    # 1) Основные селекторы
+    url_elem = select_first(card, "card_url")
+    if url_elem and url_elem.get("href"):
+        href = url_elem.get("href")
+        if href.startswith("/"):
+            return f"https://www.avito.ru{href}"
+        return href
+
+    # 2) Любая ссылка на карточку Avito внутри контейнера
+    for a in card.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        if href.startswith("/"):
+            candidate = f"https://www.avito.ru{href}"
+        else:
+            candidate = href
+        if validate_url(candidate):
+            return candidate
+
+    # 3) Fallback по html контейнера (если href в data-атрибутах)
+    html_fragment = str(card)
+    match = re.search(r'href=["\'](/[^"\']+)["\']', html_fragment)
+    if match:
+        candidate = f"https://www.avito.ru{match.group(1)}"
+        if validate_url(candidate):
+            return candidate
+
+    return ""
+
+
+def extract_title_from_card(card, item_url: str = "") -> str:
+    """Робастно извлекает title карточки, даже если блок частично не прогрузился."""
+    title_elem = select_first(card, "card_title")
+    if title_elem:
+        text = title_elem.get_text(" ", strip=True)
+        if text:
+            return text
+
+    # fallback 1: текст любой ссылки
+    for a in card.select("a[href]"):
+        text = a.get_text(" ", strip=True)
+        if text and len(text) > 3:
+            return text
+        aria = (a.get("aria-label") or "").strip()
+        if aria:
+            return aria
+
+    # fallback 2: alt у изображения
+    img = card.select_one("img[alt]")
+    if img:
+        alt = (img.get("alt") or "").strip()
+        if alt:
+            return alt
+
+    # fallback 3: из URL
+    if item_url:
+        slug = item_url.rstrip("/").split("/")[-1]
+        slug = re.sub(r"-\d+$", "", slug).replace("-", " ").strip()
+        if slug:
+            return slug
+
+    return ""
+
+
 def normalize_seller_preview_name(raw_name: str) -> str:
     """
     Нормализует имя автора из карточки выдачи.
@@ -1067,6 +1134,8 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
     runtime_seen_signatures = set(seen_signatures or set())
     total_raw_cards = 0
     total_favorite_cards = 0
+    total_with_url = 0
+    total_without_url = 0
     total_price_skipped = 0
     total_broker_skipped = 0
     total_seen_skipped = 0
@@ -1131,31 +1200,29 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
             human_delay(0.5, 1.5)
             
             page_listings = []
+            page_with_url = 0
             for card in cards:
                 try:
-                    # Извлекаем название
-                    title_elem = select_first(card, "card_title")
-                    title = title_elem.get_text(strip=True) if title_elem else ""
-                    
-                    # Фильтрация мусорных заголовков типа "Ещё 5 фото" (текст кнопки/оверлея)
-                    if title and ("ещё" in title.lower() and "фото" in title.lower()):
-                        logger.debug(f"Пропуск мусорного title: {title}")
-                        continue
-                    
                     # Извлекаем URL
-                    url_elem = select_first(card, "card_url")
-                    item_url = ""
-                    if url_elem and url_elem.get("href"):
-                        href = url_elem.get("href")
-                        if href.startswith("/"):
-                            item_url = f"https://www.avito.ru{href}"
-                        else:
-                            item_url = href
+                    item_url = extract_item_url_from_card(card)
                     
                     # Валидация URL
                     if item_url and not validate_url(item_url):
                         logger.debug(f"Пропуск карточки с невалидным URL: {item_url}")
                         continue
+
+                    if not item_url:
+                        total_without_url += 1
+                        logger.debug("Пропуск карточки: не удалось извлечь URL из контейнера")
+                        continue
+
+                    total_with_url += 1
+                    page_with_url += 1
+
+                    # Извлекаем название (после определения URL, чтобы был fallback)
+                    title = extract_title_from_card(card, item_url=item_url)
+                    if not title:
+                        title = "Без названия"
                     
                     # Извлекаем цену
                     price = 0
@@ -1208,13 +1275,13 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
             
             if not page_listings:
                 logger.info(
-                    f"Страница {current_page}: после первичной фильтрации карточек нет "
+                    f"Страница {current_page}: контейнеров={len(cards)}, URL распознано={page_with_url}, после первичной фильтрации карточек нет "
                     f"(всего после фильтрации: {total_raw_cards}/{len(all_listings)}), идём дальше по пагинации"
                 )
             else:
                 all_listings.extend(page_listings)
                 logger.info(
-                    f"Страница {current_page}: добавлено {len(page_listings)} карточек "
+                    f"Страница {current_page}: контейнеров={len(cards)}, URL распознано={page_with_url}, добавлено {len(page_listings)} карточек "
                     f"(всего после фильтрации: {total_raw_cards}/{len(all_listings)})"
                 )
 
@@ -1236,10 +1303,12 @@ def collect_listings(page, search_url: str, price_min: int, brokers_set: set, se
         pagination_progress.update(page_task, completed=MAX_PAGES, cards=len(all_listings))
     
     logger.info(
-        "Итог первичного сбора: сырых карточек=%s (по сердцам=%s), после фильтрации=%s (%s/%s), "
-        "пропущено по цене=%s, пропущено брокеров=%s, пропущено как дубли title+seller=%s",
+        "Итог первичного сбора: сырых карточек=%s (по сердцам=%s), распознано URL=%s, не распознано URL=%s, "
+        "после фильтрации=%s (%s/%s), пропущено по цене=%s, пропущено брокеров=%s, пропущено как дубли title+seller=%s",
         total_raw_cards,
         total_favorite_cards,
+        total_with_url,
+        total_without_url,
         len(all_listings),
         total_raw_cards,
         len(all_listings),
